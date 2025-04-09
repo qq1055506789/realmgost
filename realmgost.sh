@@ -102,7 +102,7 @@ install_realm() {
             ;;
     esac
     
-    local download_url="https://github.com/zhboner/realm/releases/download/v2.7.0/realm-2.7.0-linux-${arch}.tar.gz"
+    local download_url="https://github.com/zhboner/realm/releases/download/v${LATEST_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz"
     
     if ! wget -O /tmp/realm.tar.gz "$download_url"; then
         echo -e "${RED}下载Realm失败！${NC}"

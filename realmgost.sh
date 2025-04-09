@@ -2,8 +2,10 @@
 
 # Lee增强版 Realm & GOST 一键管理脚本
 # 功能：支持多条转发规则、备注管理、状态查看
-# 版本：v2.1
-# 修改说明：更新Realm下载地址为 x86_64-unknown-linux-gnu 格式
+# 版本：v2.3
+# 修改说明：
+#   1. 使用已验证的GOST下载地址格式：gost_<version>_linux_<arch>.tar.gz
+#   2. 保持Realm的x86_64-unknown-linux-gnu格式
 
 # 颜色定义
 RED='\033[0;31m'
@@ -88,7 +90,7 @@ install_realm() {
         exit 1
     fi
     
-    # 修改为 x86_64-unknown-linux-gnu 格式下载地址
+    # 使用 x86_64-unknown-linux-gnu 格式下载地址
     local download_url="https://github.com/zhboner/realm/releases/download/${latest_version}/realm-x86_64-unknown-linux-gnu.tar.gz"
     
     if ! wget -O /tmp/realm.tar.gz "$download_url"; then
@@ -123,6 +125,7 @@ install_gost() {
         exit 1
     fi
     
+    # 使用已验证的下载地址格式：gost_<version>_linux_<arch>.tar.gz
     local arch=$(uname -m)
     case $arch in
         x86_64)
@@ -137,15 +140,24 @@ install_gost() {
             ;;
     esac
     
-    local download_url="https://github.com/ginuerzh/gost/releases/download/${latest_version}/gost-linux-${arch}-${latest_version}.gz"
+    local download_url="https://github.com/ginuerzh/gost/releases/download/${latest_version}/gost_${latest_version#v}_linux_${arch}.tar.gz"
     
-    if ! wget -O /tmp/gost.gz "$download_url"; then
+    if ! wget -O /tmp/gost.tar.gz "$download_url"; then
         echo -e "${RED}下载GOST失败！${NC}"
         exit 1
     fi
     
-    gzip -d /tmp/gost.gz
-    mv /tmp/gost /usr/local/bin/gost
+    tar -xzf /tmp/gost.tar.gz -C /tmp
+    # 注意：解压后的可执行文件可能在子目录中（如gost_2.12.0_linux_amd64/gost）
+    if [ -f "/tmp/gost" ]; then
+        mv /tmp/gost /usr/local/bin/gost
+    elif [ -d "/tmp/gost_${latest_version#v}_linux_${arch}" ]; then
+        mv "/tmp/gost_${latest_version#v}_linux_${arch}/gost" /usr/local/bin/gost
+    else
+        echo -e "${RED}无法找到GOST可执行文件！${NC}"
+        exit 1
+    fi
+    
     chmod +x /usr/local/bin/gost
     
     if ! command -v gost &> /dev/null; then
@@ -156,8 +168,323 @@ install_gost() {
     echo -e "${GREEN}GOST安装成功！版本: $latest_version${NC}"
 }
 
-# 其余函数保持不变（add_forward_rule、delete_forward_rule、configure_services等）
-# ...（保持原有函数不变）...
+# 添加转发规则
+add_forward_rule() {
+    local tool=$1
+    local local_port=$2
+    local remote_addr=$3
+    local note=$4
+    
+    case $tool in
+        realm)
+            config_file="$REALM_CONFIG"
+            echo "$local_port $remote_addr" >> "$config_file"
+            ;;
+        gost)
+            config_file="$GOST_CONFIG"
+            echo "$local_port $remote_addr" >> "$config_file"
+            ;;
+        *)
+            echo -e "${RED}未知工具: $tool${NC}"
+            return 1
+            ;;
+    esac
+    
+    # 添加备注
+    if [ -n "$note" ]; then
+        echo "$tool $local_port $remote_addr $note" >> "$NOTES_CONFIG"
+    fi
+    
+    echo -e "${GREEN}成功添加 $tool 转发规则: 本地端口 $local_port -> $remote_addr${NC}"
+    if [ -n "$note" ]; then
+        echo -e "${CYAN}备注: $note${NC}"
+    fi
+}
+
+# 删除转发规则
+delete_forward_rule() {
+    local tool=$1
+    local local_port=$2
+    
+    case $tool in
+        realm)
+            config_file="$REALM_CONFIG"
+            ;;
+        gost)
+            config_file="$GOST_CONFIG"
+            ;;
+        *)
+            echo -e "${RED}未知工具: $tool${NC}"
+            return 1
+            ;;
+    esac
+    
+    # 删除规则
+    sed -i "/^$local_port /d" "$config_file"
+    
+    # 删除备注
+    sed -i "/^$tool $local_port /d" "$NOTES_CONFIG"
+    
+    echo -e "${GREEN}已删除 $tool 端口 $local_port 的转发规则${NC}"
+}
+
+# 更新备注
+update_note() {
+    local tool=$1
+    local local_port=$2
+    local new_note=$3
+    
+    # 先删除旧备注
+    sed -i "/^$tool $local_port /d" "$NOTES_CONFIG"
+    
+    # 添加新备注
+    if [ -n "$new_note" ]; then
+        # 获取远程地址
+        case $tool in
+            realm)
+                remote_addr=$(grep "^$local_port " "$REALM_CONFIG" | awk '{print $2}')
+                ;;
+            gost)
+                remote_addr=$(grep "^$local_port " "$GOST_CONFIG" | awk '{print $2}')
+                ;;
+        esac
+        
+        if [ -n "$remote_addr" ]; then
+            echo "$tool $local_port $remote_addr $new_note" >> "$NOTES_CONFIG"
+            echo -e "${GREEN}已更新 $tool 端口 $local_port 的备注${NC}"
+        else
+            echo -e "${RED}找不到对应的转发规则，无法添加备注${NC}"
+        fi
+    fi
+}
+
+# 生成服务配置文件
+generate_service_file() {
+    local tool=$1
+    local config_file=$2
+    
+    # 生成命令参数
+    local cmd_args=""
+    while read -r line; do
+        local_port=$(echo "$line" | awk '{print $1}')
+        remote_addr=$(echo "$line" | awk '{print $2}')
+        
+        case $tool in
+            realm)
+                cmd_args+=" -l $local_port -r $remote_addr"
+                ;;
+            gost)
+                cmd_args+=" -L=tcp://:$local_port/$remote_addr"
+                ;;
+        esac
+    done < "$config_file"
+    
+    # 生成服务文件
+    cat > /etc/systemd/system/${tool}.service <<EOF
+[Unit]
+Description=${tool^^} Port Forwarding Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/${tool}${cmd_args}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 配置服务
+configure_services() {
+    echo -e "${YELLOW}正在配置服务...${NC}"
+    
+    # 配置Realm服务
+    if [ -s "$REALM_CONFIG" ]; then
+        generate_service_file "realm" "$REALM_CONFIG"
+        systemctl daemon-reload
+        systemctl enable realm.service
+        echo -e "${GREEN}Realm服务配置完成！${NC}"
+    fi
+    
+    # 配置GOST服务
+    if [ -s "$GOST_CONFIG" ]; then
+        generate_service_file "gost" "$GOST_CONFIG"
+        systemctl daemon-reload
+        systemctl enable gost.service
+        echo -e "${GREEN}GOST服务配置完成！${NC}"
+    fi
+}
+
+# 启动服务
+start_services() {
+    for tool in realm gost; do
+        if [ -f "/etc/systemd/system/${tool}.service" ]; then
+            echo -e "${YELLOW}正在启动${tool}服务...${NC}"
+            systemctl start ${tool}.service
+            
+            if systemctl is-active --quiet ${tool}.service; then
+                echo -e "${GREEN}${tool}服务启动成功！${NC}"
+            else
+                echo -e "${RED}${tool}服务启动失败！${NC}"
+                journalctl -u ${tool}.service -n 10 --no-pager
+            fi
+        fi
+    done
+}
+
+# 显示所有转发规则
+show_all_rules() {
+    echo -e "\n${BLUE}====== 所有转发规则 ======${NC}"
+    
+    # 显示Realm规则
+    if [ -s "$REALM_CONFIG" ]; then
+        echo -e "\n${PURPLE}Realm 转发规则:${NC}"
+        while read -r line; do
+            local_port=$(echo "$line" | awk '{print $1}')
+            remote_addr=$(echo "$line" | awk '{print $2}')
+            
+            # 查找备注
+            note=$(grep "^realm $local_port " "$NOTES_CONFIG" | cut -d' ' -f4-)
+            
+            echo -e "本地端口: ${GREEN}$local_port${NC} -> 远程地址: ${GREEN}$remote_addr${NC}"
+            if [ -n "$note" ]; then
+                echo -e "备注: ${CYAN}$note${NC}"
+            fi
+            echo "------------------------"
+        done < "$REALM_CONFIG"
+    else
+        echo -e "\n${YELLOW}没有配置Realm转发规则${NC}"
+    fi
+    
+    # 显示GOST规则
+    if [ -s "$GOST_CONFIG" ]; then
+        echo -e "\n${PURPLE}GOST 转发规则:${NC}"
+        while read -r line; do
+            local_port=$(echo "$line" | awk '{print $1}')
+            remote_addr=$(echo "$line" | awk '{print $2}')
+            
+            # 查找备注
+            note=$(grep "^gost $local_port " "$NOTES_CONFIG" | cut -d' ' -f4-)
+            
+            echo -e "本地端口: ${GREEN}$local_port${NC} -> 远程地址: ${GREEN}$remote_addr${NC}"
+            if [ -n "$note" ]; then
+                echo -e "备注: ${CYAN}$note${NC}"
+            fi
+            echo "------------------------"
+        done < "$GOST_CONFIG"
+    else
+        echo -e "\n${YELLOW}没有配置GOST转发规则${NC}"
+    fi
+}
+
+# 显示服务状态
+show_service_status() {
+    echo -e "\n${BLUE}====== 服务状态 ======${NC}"
+    for tool in realm gost; do
+        if [ -f "/etc/systemd/system/${tool}.service" ]; then
+            echo -e "\n${YELLOW}${tool} 服务状态:${NC}"
+            systemctl status ${tool}.service --no-pager -l
+        fi
+    done
+    
+    echo -e "\n${BLUE}====== 监听端口 ======${NC}"
+    netstat -tulnp | grep -E "realm|gost"
+}
+
+# 添加转发规则菜单
+add_rule_menu() {
+    echo -e "\n${BLUE}====== 添加转发规则 ======${NC}"
+    echo "1) 添加Realm转发规则"
+    echo "2) 添加GOST转发规则"
+    echo "0) 返回主菜单"
+    read -p "请选择操作(0-2): " choice
+    
+    case $choice in
+        1)
+            read -p "请输入本地监听端口: " local_port
+            read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+            read -p "请输入备注(可选，直接回车跳过): " note
+            add_forward_rule "realm" "$local_port" "$remote_addr" "$note"
+            configure_services
+            start_services
+            ;;
+        2)
+            read -p "请输入本地监听端口: " local_port
+            read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+            read -p "请输入备注(可选，直接回车跳过): " note
+            add_forward_rule "gost" "$local_port" "$remote_addr" "$note"
+            configure_services
+            start_services
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择！${NC}"
+            ;;
+    esac
+}
+
+# 删除转发规则菜单
+delete_rule_menu() {
+    echo -e "\n${BLUE}====== 删除转发规则 ======${NC}"
+    echo "1) 删除Realm转发规则"
+    echo "2) 删除GOST转发规则"
+    echo "0) 返回主菜单"
+    read -p "请选择操作(0-2): " choice
+    
+    case $choice in
+        1)
+            read -p "请输入要删除的本地端口: " local_port
+            delete_forward_rule "realm" "$local_port"
+            configure_services
+            systemctl restart realm.service
+            ;;
+        2)
+            read -p "请输入要删除的本地端口: " local_port
+            delete_forward_rule "gost" "$local_port"
+            configure_services
+            systemctl restart gost.service
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择！${NC}"
+            ;;
+    esac
+}
+
+# 更新备注菜单
+update_note_menu() {
+    echo -e "\n${BLUE}====== 更新备注 ======${NC}"
+    echo "1) 更新Realm规则备注"
+    echo "2) 更新GOST规则备注"
+    echo "0) 返回主菜单"
+    read -p "请选择操作(0-2): " choice
+    
+    case $choice in
+        1)
+            read -p "请输入本地端口: " local_port
+            read -p "请输入新备注: " new_note
+            update_note "realm" "$local_port" "$new_note"
+            ;;
+        2)
+            read -p "请输入本地端口: " local_port
+            read -p "请输入新备注: " new_note
+            update_note "gost" "$local_port" "$new_note"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择！${NC}"
+            ;;
+    esac
+}
 
 # 主菜单
 main_menu() {

@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# Lee增强版 Realm & GOST 一键管理脚本
+# 增强版 Realm & GOST 一键管理脚本
 # 功能：支持多条转发规则、备注管理、状态查看
-# 版本：v2.3
+# 版本：v2.4
 # 修改说明：
-#   1. 使用已验证的GOST下载地址格式：gost_<version>_linux_<arch>.tar.gz
-#   2. 保持Realm的x86_64-unknown-linux-gnu格式
+#   1. 修复Realm服务启动失败问题（参数格式错误）
+#   2. 优化服务文件生成逻辑
+#   3. 添加输入验证
 
 # 颜色定义
 RED='\033[0;31m'
@@ -168,6 +169,26 @@ install_gost() {
     echo -e "${GREEN}GOST安装成功！版本: $latest_version${NC}"
 }
 
+# 验证端口和地址格式
+validate_input() {
+    local port=$1
+    local addr=$2
+    
+    # 验证端口
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${RED}错误：端口号必须是1-65535之间的数字！${NC}"
+        return 1
+    fi
+    
+    # 验证地址格式 (IP:端口 或 域名:端口)
+    if ! [[ "$addr" =~ ^[^:]+:[0-9]+$ ]]; then
+        echo -e "${RED}错误：远程地址格式应为 IP:端口 或 域名:端口！${NC}"
+        return 1
+    fi
+    
+    return 0
+}
+
 # 添加转发规则
 add_forward_rule() {
     local tool=$1
@@ -175,13 +196,28 @@ add_forward_rule() {
     local remote_addr=$3
     local note=$4
     
+    # 验证输入
+    if ! validate_input "$local_port" "$remote_addr"; then
+        return 1
+    fi
+    
     case $tool in
         realm)
             config_file="$REALM_CONFIG"
+            # 检查是否已存在相同端口的规则
+            if grep -q "^$local_port " "$config_file"; then
+                echo -e "${RED}错误：端口 $local_port 的转发规则已存在！${NC}"
+                return 1
+            fi
             echo "$local_port $remote_addr" >> "$config_file"
             ;;
         gost)
             config_file="$GOST_CONFIG"
+            # 检查是否已存在相同端口的规则
+            if grep -q "^$local_port " "$config_file"; then
+                echo -e "${RED}错误：端口 $local_port 的转发规则已存在！${NC}"
+                return 1
+            fi
             echo "$local_port $remote_addr" >> "$config_file"
             ;;
         *)
@@ -219,6 +255,12 @@ delete_forward_rule() {
             ;;
     esac
     
+    # 检查规则是否存在
+    if ! grep -q "^$local_port " "$config_file"; then
+        echo -e "${RED}错误：找不到端口 $local_port 的转发规则！${NC}"
+        return 1
+    fi
+    
     # 删除规则
     sed -i "/^$local_port /d" "$config_file"
     
@@ -233,6 +275,22 @@ update_note() {
     local tool=$1
     local local_port=$2
     local new_note=$3
+    
+    # 检查规则是否存在
+    case $tool in
+        realm)
+            if ! grep -q "^$local_port " "$REALM_CONFIG"; then
+                echo -e "${RED}错误：找不到端口 $local_port 的转发规则！${NC}"
+                return 1
+            fi
+            ;;
+        gost)
+            if ! grep -q "^$local_port " "$GOST_CONFIG"; then
+                echo -e "${RED}错误：找不到端口 $local_port 的转发规则！${NC}"
+                return 1
+            fi
+            ;;
+    esac
     
     # 先删除旧备注
     sed -i "/^$tool $local_port /d" "$NOTES_CONFIG"
@@ -254,41 +312,66 @@ update_note() {
             echo -e "${GREEN}已更新 $tool 端口 $local_port 的备注${NC}"
         else
             echo -e "${RED}找不到对应的转发规则，无法添加备注${NC}"
+            return 1
         fi
     fi
 }
 
-# 生成服务配置文件
-generate_service_file() {
-    local tool=$1
-    local config_file=$2
+# 生成Realm服务配置文件
+generate_realm_service() {
+    local config_file="$1"
+    local cmd_args=""
     
     # 生成命令参数
-    local cmd_args=""
     while read -r line; do
         local_port=$(echo "$line" | awk '{print $1}')
         remote_addr=$(echo "$line" | awk '{print $2}')
         
-        case $tool in
-            realm)
-                cmd_args+=" -l $local_port -r $remote_addr"
-                ;;
-            gost)
-                cmd_args+=" -L=tcp://:$local_port/$remote_addr"
-                ;;
-        esac
+        # Realm需要正确的IP:端口格式
+        cmd_args+=" -l :$local_port -r $remote_addr"
     done < "$config_file"
     
     # 生成服务文件
-    cat > /etc/systemd/system/${tool}.service <<EOF
+    cat > /etc/systemd/system/realm.service <<EOF
 [Unit]
-Description=${tool^^} Port Forwarding Service
+Description=REALM Port Forwarding Service
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/${tool}${cmd_args}
+ExecStart=/usr/local/bin/realm$cmd_args
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 生成GOST服务配置文件
+generate_gost_service() {
+    local config_file="$1"
+    local cmd_args=""
+    
+    # 生成命令参数
+    while read -r line; do
+        local_port=$(echo "$line" | awk '{print $1}')
+        remote_addr=$(echo "$line" | awk '{print $2}')
+        
+        cmd_args+=" -L=tcp://:$local_port/$remote_addr"
+    done < "$config_file"
+    
+    # 生成服务文件
+    cat > /etc/systemd/system/gost.service <<EOF
+[Unit]
+Description=GOST Port Forwarding Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/gost$cmd_args
 Restart=always
 RestartSec=3
 
@@ -303,7 +386,7 @@ configure_services() {
     
     # 配置Realm服务
     if [ -s "$REALM_CONFIG" ]; then
-        generate_service_file "realm" "$REALM_CONFIG"
+        generate_realm_service "$REALM_CONFIG"
         systemctl daemon-reload
         systemctl enable realm.service
         echo -e "${GREEN}Realm服务配置完成！${NC}"
@@ -311,7 +394,7 @@ configure_services() {
     
     # 配置GOST服务
     if [ -s "$GOST_CONFIG" ]; then
-        generate_service_file "gost" "$GOST_CONFIG"
+        generate_gost_service "$GOST_CONFIG"
         systemctl daemon-reload
         systemctl enable gost.service
         echo -e "${GREEN}GOST服务配置完成！${NC}"
@@ -404,16 +487,26 @@ add_rule_menu() {
     
     case $choice in
         1)
-            read -p "请输入本地监听端口: " local_port
-            read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+            while true; do
+                read -p "请输入本地监听端口: " local_port
+                read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+                if validate_input "$local_port" "$remote_addr"; then
+                    break
+                fi
+            done
             read -p "请输入备注(可选，直接回车跳过): " note
             add_forward_rule "realm" "$local_port" "$remote_addr" "$note"
             configure_services
             start_services
             ;;
         2)
-            read -p "请输入本地监听端口: " local_port
-            read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+            while true; do
+                read -p "请输入本地监听端口: " local_port
+                read -p "请输入远程目标地址(格式: IP或域名:端口): " remote_addr
+                if validate_input "$local_port" "$remote_addr"; then
+                    break
+                fi
+            done
             read -p "请输入备注(可选，直接回车跳过): " note
             add_forward_rule "gost" "$local_port" "$remote_addr" "$note"
             configure_services
@@ -441,13 +534,13 @@ delete_rule_menu() {
             read -p "请输入要删除的本地端口: " local_port
             delete_forward_rule "realm" "$local_port"
             configure_services
-            systemctl restart realm.service
+            systemctl restart realm.service 2>/dev/null
             ;;
         2)
             read -p "请输入要删除的本地端口: " local_port
             delete_forward_rule "gost" "$local_port"
             configure_services
-            systemctl restart gost.service
+            systemctl restart gost.service 2>/dev/null
             ;;
         0)
             return

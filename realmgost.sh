@@ -2,11 +2,11 @@
 
 # 增强版 Realm & GOST 一键管理脚本
 # 功能：支持多条转发规则、备注管理、状态查看
-# 版本：v2.4
+# 版本：v2.5
 # 修改说明：
-#   1. 修复Realm服务启动失败问题（参数格式错误）
-#   2. 优化服务文件生成逻辑
-#   3. 添加输入验证
+#   1. 修复Realm服务DNS解析失败问题
+#   2. 改进远程地址验证逻辑
+#   3. 添加IP地址解析功能
 
 # 颜色定义
 RED='\033[0;31m'
@@ -57,14 +57,14 @@ check_system() {
 install_dependencies() {
     echo -e "${YELLOW}正在安装必要依赖...${NC}"
     if [ "$SYSTEM" = "centos" ]; then
-        yum install -y wget unzip curl tar jq
+        yum install -y wget unzip curl tar jq bind-utils
     else
         apt-get update
-        apt-get install -y wget unzip curl tar jq
+        apt-get install -y wget unzip curl tar jq dnsutils
     fi
     
-    if ! command -v wget &> /dev/null || ! command -v jq &> /dev/null; then
-        echo -e "${RED}依赖安装失败，请手动安装wget和jq后重试！${NC}"
+    if ! command -v wget &> /dev/null || ! command -v jq &> /dev/null || ! command -v dig &> /dev/null; then
+        echo -e "${RED}依赖安装失败，请手动安装wget、jq和dnsutils后重试！${NC}"
         exit 1
     fi
 }
@@ -169,6 +169,19 @@ install_gost() {
     echo -e "${GREEN}GOST安装成功！版本: $latest_version${NC}"
 }
 
+# 解析域名获取IP地址
+resolve_domain() {
+    local domain=$1
+    local ip=$(dig +short "$domain" | head -n1)
+    
+    if [ -z "$ip" ]; then
+        echo -e "${RED}无法解析域名: $domain${NC}"
+        return 1
+    fi
+    
+    echo "$ip"
+}
+
 # 验证端口和地址格式
 validate_input() {
     local port=$1
@@ -180,13 +193,31 @@ validate_input() {
         return 1
     fi
     
-    # 验证地址格式 (IP:端口 或 域名:端口)
-    if ! [[ "$addr" =~ ^[^:]+:[0-9]+$ ]]; then
-        echo -e "${RED}错误：远程地址格式应为 IP:端口 或 域名:端口！${NC}"
+    # 分离地址和端口
+    local remote_host=${addr%:*}
+    local remote_port=${addr##*:}
+    
+    # 验证远程端口
+    if ! [[ "$remote_port" =~ ^[0-9]+$ ]] || [ "$remote_port" -lt 1 ] || [ "$remote_port" -gt 65535 ]; then
+        echo -e "${RED}错误：远程端口号必须是1-65535之间的数字！${NC}"
         return 1
     fi
     
-    return 0
+    # 验证远程主机
+    if [[ "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # 已经是IP地址
+        return 0
+    elif [[ "$remote_host" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        # 是域名，尝试解析
+        local ip=$(resolve_domain "$remote_host")
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+        return 0
+    else
+        echo -e "${RED}错误：远程地址格式应为 IP:端口 或 域名:端口！${NC}"
+        return 1
+    fi
 }
 
 # 添加转发规则
@@ -327,6 +358,20 @@ generate_realm_service() {
         local_port=$(echo "$line" | awk '{print $1}')
         remote_addr=$(echo "$line" | awk '{print $2}')
         
+        # 分离远程地址和端口
+        remote_host=${remote_addr%:*}
+        remote_port=${remote_addr##*:}
+        
+        # 如果是域名，解析为IP
+        if [[ ! "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            remote_host=$(resolve_domain "$remote_host")
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}错误：无法解析域名 $remote_host${NC}"
+                return 1
+            fi
+            remote_addr="$remote_host:$remote_port"
+        fi
+        
         # Realm需要正确的IP:端口格式
         cmd_args+=" -l :$local_port -r $remote_addr"
     done < "$config_file"
@@ -386,7 +431,10 @@ configure_services() {
     
     # 配置Realm服务
     if [ -s "$REALM_CONFIG" ]; then
-        generate_realm_service "$REALM_CONFIG"
+        if ! generate_realm_service "$REALM_CONFIG"; then
+            echo -e "${RED}Realm服务配置失败！${NC}"
+            return 1
+        fi
         systemctl daemon-reload
         systemctl enable realm.service
         echo -e "${GREEN}Realm服务配置完成！${NC}"

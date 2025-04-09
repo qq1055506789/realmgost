@@ -2,11 +2,14 @@
 
 # 增强版 Realm & GOST 一键管理脚本
 # 功能：支持多条转发规则、备注管理、状态查看
-# 版本：v2.6
+# 版本：v2.7
 # 修改说明：
-#   1. 修复GOST域名解析问题（启动时预解析为IP）
-#   2. 统一Realm和GOST的地址处理逻辑
-#   3. 增强错误处理和日志提示
+#   1. 修复依赖安装问题，添加epel-release支持
+#   2. 增强服务管理逻辑，增加存在性检查
+#   3. 改进域名解析，添加超时和重试机制
+#   4. 支持IPv6地址格式
+#   5. 优化配置文件权限设置
+#   6. 完善卸载功能
 
 # 颜色定义
 RED='\033[0;31m'
@@ -22,6 +25,12 @@ CONFIG_DIR="/etc/forward_tools"
 REALM_CONFIG="$CONFIG_DIR/realm_rules.conf"
 GOST_CONFIG="$CONFIG_DIR/gost_rules.conf"
 NOTES_CONFIG="$CONFIG_DIR/forward_notes.conf"
+DNS_CACHE_FILE="$CONFIG_DIR/dns_cache.json"
+
+# 检查命令是否存在
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
 
 # 检查root权限
 check_root() {
@@ -51,21 +60,37 @@ check_system() {
         echo -e "${RED}不支持的系统！${NC}"
         exit 1
     fi
+    
+    # 检查systemd
+    if ! command_exists systemctl; then
+        echo -e "${RED}错误：此脚本需要systemd系统！${NC}"
+        exit 1
+    fi
 }
 
 # 安装依赖
 install_dependencies() {
     echo -e "${YELLOW}正在安装必要依赖...${NC}"
     if [ "$SYSTEM" = "centos" ]; then
+        yum install -y epel-release
         yum install -y wget unzip curl tar jq bind-utils
     else
         apt-get update
         apt-get install -y wget unzip curl tar jq dnsutils
     fi
     
-    if ! command -v wget &> /dev/null || ! command -v jq &> /dev/null || ! command -v dig &> /dev/null; then
+    if ! command_exists wget || ! command_exists jq || ! command_exists dig; then
         echo -e "${RED}依赖安装失败，请手动安装wget、jq和dnsutils后重试！${NC}"
         exit 1
+    fi
+    
+    # 检查netstat或ss
+    if ! command_exists netstat && ! command_exists ss; then
+        if [ "$SYSTEM" = "centos" ]; then
+            yum install -y net-tools
+        else
+            apt-get install -y net-tools
+        fi
     fi
 }
 
@@ -73,18 +98,20 @@ install_dependencies() {
 init_config_dir() {
     mkdir -p "$CONFIG_DIR"
     touch "$REALM_CONFIG" "$GOST_CONFIG" "$NOTES_CONFIG"
-    chmod 600 "$REALM_CONFIG" "$GOST_CONFIG" "$NOTES_CONFIG"
+    touch "$DNS_CACHE_FILE"
+    chmod 644 "$REALM_CONFIG" "$GOST_CONFIG" "$NOTES_CONFIG"
+    chmod 600 "$DNS_CACHE_FILE"
 }
 
 # 安装Realm
 install_realm() {
-    if command -v realm &> /dev/null; then
+    if command_exists realm; then
         echo -e "${YELLOW}Realm 已安装，跳过安装步骤。${NC}"
         return
     fi
     
     echo -e "${YELLOW}正在安装Realm...${NC}"
-    local latest_version=$(curl -s https://api.github.com/repos/zhboner/realm/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    local latest_version=$(curl -s --connect-timeout 10 https://api.github.com/repos/zhboner/realm/releases/latest | grep 'tag_name' | cut -d\" -f4)
     
     if [ -z "$latest_version" ]; then
         echo -e "${RED}无法获取Realm最新版本！${NC}"
@@ -93,7 +120,7 @@ install_realm() {
     
     local download_url="https://github.com/zhboner/realm/releases/download/${latest_version}/realm-x86_64-unknown-linux-gnu.tar.gz"
     
-    if ! wget -O /tmp/realm.tar.gz "$download_url"; then
+    if ! wget --timeout=30 -O /tmp/realm.tar.gz "$download_url"; then
         echo -e "${RED}下载Realm失败！${NC}"
         exit 1
     fi
@@ -102,7 +129,7 @@ install_realm() {
     mv /tmp/realm /usr/local/bin/realm
     chmod +x /usr/local/bin/realm
     
-    if ! command -v realm &> /dev/null; then
+    if ! command_exists realm; then
         echo -e "${RED}Realm安装失败！${NC}"
         exit 1
     fi
@@ -112,13 +139,13 @@ install_realm() {
 
 # 安装GOST
 install_gost() {
-    if command -v gost &> /dev/null; then
+    if command_exists gost; then
         echo -e "${YELLOW}GOST 已安装，跳过安装步骤。${NC}"
         return
     fi
     
     echo -e "${YELLOW}正在安装GOST...${NC}"
-    local latest_version=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    local latest_version=$(curl -s --connect-timeout 10 https://api.github.com/repos/ginuerzh/gost/releases/latest | grep 'tag_name' | cut -d\" -f4)
     
     if [ -z "$latest_version" ]; then
         echo -e "${RED}无法获取GOST最新版本！${NC}"
@@ -134,7 +161,7 @@ install_gost() {
     
     local download_url="https://github.com/ginuerzh/gost/releases/download/${latest_version}/gost_${latest_version#v}_linux_${arch}.tar.gz"
     
-    if ! wget -O /tmp/gost.tar.gz "$download_url"; then
+    if ! wget --timeout=30 -O /tmp/gost.tar.gz "$download_url"; then
         echo -e "${RED}下载GOST失败！${NC}"
         exit 1
     fi
@@ -151,7 +178,7 @@ install_gost() {
     
     chmod +x /usr/local/bin/gost
     
-    if ! command -v gost &> /dev/null; then
+    if ! command_exists gost; then
         echo -e "${RED}GOST安装失败！${NC}"
         exit 1
     fi
@@ -159,14 +186,37 @@ install_gost() {
     echo -e "${GREEN}GOST安装成功！版本: $latest_version${NC}"
 }
 
-# 解析域名获取IP地址
+# 解析域名获取IP地址（带缓存和超时）
 resolve_domain() {
     local domain=$1
-    local ip=$(dig +short "$domain" | head -n1)
+    local cached_ip
+    
+    # 检查缓存
+    if [ -f "$DNS_CACHE_FILE" ]; then
+        cached_ip=$(jq -r --arg domain "$domain" '.[$domain] // empty' "$DNS_CACHE_FILE")
+        if [ -n "$cached_ip" ]; then
+            echo "$cached_ip"
+            return 0
+        fi
+    fi
+    
+    # 解析域名（带超时）
+    local ip=$(dig +short +time=3 +tries=2 "$domain" | head -n1 | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
     
     if [ -z "$ip" ]; then
-        echo -e "${RED}无法解析域名: $domain${NC}"
-        return 1
+        # 尝试IPv6解析
+        ip=$(dig +short AAAA "$domain" | head -n1 | grep -E '^[0-9a-fA-F:]+$')
+        if [ -z "$ip" ]; then
+            echo -e "${RED}无法解析域名: $domain${NC}" >&2
+            return 1
+        fi
+    fi
+    
+    # 更新缓存
+    if [ -f "$DNS_CACHE_FILE" ]; then
+        jq --arg domain "$domain" --arg ip "$ip" '.[$domain] = $ip' "$DNS_CACHE_FILE" > /tmp/dns_cache.tmp && mv /tmp/dns_cache.tmp "$DNS_CACHE_FILE"
+    else
+        echo "{\"$domain\":\"$ip\"}" > "$DNS_CACHE_FILE"
     fi
     
     echo "$ip"
@@ -194,8 +244,9 @@ validate_input() {
     fi
     
     # 验证远程主机
-    if [[ "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        return 0  # 是IP地址
+    if [[ "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || 
+       [[ "$remote_host" =~ ^[0-9a-fA-F:]+$ ]]; then
+        return 0  # 是IP地址（IPv4或IPv6）
     elif [[ "$remote_host" =~ ^[a-zA-Z0-9.-]+$ ]]; then
         # 是域名，尝试解析
         if ! resolve_domain "$remote_host" >/dev/null; then
@@ -309,13 +360,19 @@ generate_realm_service() {
         # 解析域名
         remote_host=${remote_addr%:*}
         remote_port=${remote_addr##*:}
-        if [[ ! "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && 
+           [[ ! "$remote_host" =~ ^[0-9a-fA-F:]+$ ]]; then
             remote_host=$(resolve_domain "$remote_host") || return 1
             remote_addr="$remote_host:$remote_port"
         fi
         
         cmd_args+=" -l :$local_port -r $remote_addr"
     done < "$config_file"
+    
+    if [ -z "$cmd_args" ]; then
+        echo -e "${YELLOW}没有Realm转发规则，跳过服务配置${NC}"
+        return 0
+    fi
     
     cat > /etc/systemd/system/realm.service <<EOF
 [Unit]
@@ -328,6 +385,7 @@ User=root
 ExecStart=/usr/local/bin/realm$cmd_args
 Restart=always
 RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -346,13 +404,19 @@ generate_gost_service() {
         # 解析域名
         remote_host=${remote_addr%:*}
         remote_port=${remote_addr##*:}
-        if [[ ! "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$remote_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && 
+           [[ ! "$remote_host" =~ ^[0-9a-fA-F:]+$ ]]; then
             remote_host=$(resolve_domain "$remote_host") || return 1
             remote_addr="$remote_host:$remote_port"
         fi
         
         cmd_args+=" -L=tcp://:$local_port/$remote_addr"
     done < "$config_file"
+    
+    if [ -z "$cmd_args" ]; then
+        echo -e "${YELLOW}没有GOST转发规则，跳过服务配置${NC}"
+        return 0
+    fi
     
     cat > /etc/systemd/system/gost.service <<EOF
 [Unit]
@@ -365,6 +429,7 @@ User=root
 ExecStart=/usr/local/bin/gost$cmd_args
 Restart=always
 RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -382,7 +447,7 @@ configure_services() {
             return 1
         fi
         systemctl daemon-reload
-        systemctl enable realm.service
+        systemctl enable --now realm.service >/dev/null 2>&1
         echo -e "${GREEN}Realm服务配置完成！${NC}"
     fi
     
@@ -393,7 +458,7 @@ configure_services() {
             return 1
         fi
         systemctl daemon-reload
-        systemctl enable gost.service
+        systemctl enable --now gost.service >/dev/null 2>&1
         echo -e "${GREEN}GOST服务配置完成！${NC}"
     fi
 }
@@ -403,13 +468,18 @@ start_services() {
     for tool in realm gost; do
         if [ -f "/etc/systemd/system/${tool}.service" ]; then
             echo -e "${YELLOW}正在启动${tool}服务...${NC}"
-            systemctl start ${tool}.service
-            if systemctl is-active --quiet ${tool}.service; then
-                echo -e "${GREEN}${tool}服务启动成功！${NC}"
+            if systemctl start ${tool}.service; then
+                if systemctl is-active --quiet ${tool}.service; then
+                    echo -e "${GREEN}${tool}服务启动成功！${NC}"
+                else
+                    echo -e "${RED}${tool}服务启动失败！${NC}"
+                    journalctl -u ${tool}.service -n 10 --no-pager
+                fi
             else
-                echo -e "${RED}${tool}服务启动失败！${NC}"
-                journalctl -u ${tool}.service -n 10 --no-pager
+                echo -e "${RED}${tool}服务启动命令执行失败！${NC}"
             fi
+        else
+            echo -e "${YELLOW}${tool}服务未配置，跳过启动${NC}"
         fi
     done
 }
@@ -444,11 +514,19 @@ show_service_status() {
         if [ -f "/etc/systemd/system/${tool}.service" ]; then
             echo -e "\n${YELLOW}${tool^^} 服务状态:${NC}"
             systemctl status ${tool}.service --no-pager -l
+        else
+            echo -e "\n${YELLOW}${tool^^} 服务未配置${NC}"
         fi
     done
     
     echo -e "\n${BLUE}====== 监听端口 ======${NC}"
-    netstat -tulnp | grep -E "realm|gost"
+    if command_exists netstat; then
+        netstat -tulnp | grep -E "realm|gost" || echo -e "${YELLOW}没有找到相关监听端口${NC}"
+    elif command_exists ss; then
+        ss -tulnp | grep -E "realm|gost" || echo -e "${YELLOW}没有找到相关监听端口${NC}"
+    else
+        echo -e "${RED}无法检查监听端口，请安装net-tools或iproute2${NC}"
+    fi
 }
 
 # 主菜单
@@ -476,8 +554,22 @@ main_menu() {
             5) show_all_rules ;;
             6) show_service_status ;;
             7) start_services ;;
-            8) systemctl stop realm.service gost.service 2>/dev/null; echo -e "${GREEN}已停止所有服务${NC}" ;;
-            9) systemctl restart realm.service gost.service 2>/dev/null; echo -e "${GREEN}已重启所有服务${NC}" ;;
+            8) 
+                for tool in realm gost; do
+                    if [ -f "/etc/systemd/system/${tool}.service" ]; then
+                        systemctl stop ${tool}.service
+                        echo -e "${GREEN}已停止${tool}服务${NC}"
+                    fi
+                done 
+                ;;
+            9) 
+                for tool in realm gost; do
+                    if [ -f "/etc/systemd/system/${tool}.service" ]; then
+                        systemctl restart ${tool}.service
+                        echo -e "${GREEN}已重启${tool}服务${NC}"
+                    fi
+                done 
+                ;;
             10) uninstall_services ;;
             0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选项！${NC}" ;;
@@ -491,15 +583,39 @@ main_menu() {
 # 卸载服务
 uninstall_services() {
     read -p "确定要卸载Realm和GOST吗？(y/n): " confirm
-    if [ "$confirm" != "y" ]; then return; fi
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then 
+        echo -e "${YELLOW}取消卸载操作${NC}"
+        return
+    fi
     
-    systemctl stop realm.service gost.service 2>/dev/null
-    systemctl disable realm.service gost.service 2>/dev/null
-    rm -f /etc/systemd/system/{realm,gost}.service
+    echo -e "${YELLOW}正在卸载服务...${NC}"
+    
+    # 停止并禁用服务
+    for tool in realm gost; do
+        if systemctl is-active --quiet ${tool}.service; then
+            systemctl stop ${tool}.service
+        fi
+        if systemctl is-enabled --quiet ${tool}.service; then
+            systemctl disable ${tool}.service
+        fi
+    done
+    
+    # 删除文件
     rm -f /usr/local/bin/{realm,gost}
-    rm -rf "$CONFIG_DIR"
+    rm -f /etc/systemd/system/{realm,gost}.service
     systemctl daemon-reload
-    echo -e "${GREEN}已卸载Realm和GOST及相关配置！${NC}"
+    systemctl reset-failed
+    
+    # 询问是否删除配置
+    read -p "是否删除所有配置文件和转发规则？(y/n): " del_config
+    if [ "$del_config" = "y" ] || [ "$del_config" = "Y" ]; then
+        rm -rf "$CONFIG_DIR"
+        echo -e "${GREEN}已删除所有配置文件和转发规则${NC}"
+    else
+        echo -e "${YELLOW}保留配置文件和转发规则${NC}"
+    fi
+    
+    echo -e "${GREEN}卸载完成！${NC}"
 }
 
 # 添加规则菜单
@@ -542,7 +658,9 @@ delete_rule_menu() {
             read -p "请输入要删除的本地端口: " local_port
             delete_forward_rule "$tool" "$local_port"
             configure_services
-            systemctl restart "$tool.service" 2>/dev/null
+            if [ -f "/etc/systemd/system/${tool}.service" ]; then
+                systemctl restart "$tool.service"
+            fi
             ;;
         0) return ;;
         *) echo -e "${RED}无效选择！${NC}" ;;
